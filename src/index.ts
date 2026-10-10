@@ -8,6 +8,7 @@ const discogsToken = process.env.DISCOGS_TOKEN;
 
 async function checkDiscogs() {
   try {
+    //Discogs HTTP GET request
     const response = await axios.get(
       "https://api.discogs.com/database/search",
       {
@@ -28,6 +29,7 @@ async function checkDiscogs() {
     if (results.length > 0) {
       const firstResult = results[0];
 
+      //Discord HTTP POST request
       await axios.post(webhookUrl!, {
         content: `New vinyl found: ${firstResult.title}\n${firstResult.uri}`,
       });
