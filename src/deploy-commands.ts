@@ -29,10 +29,12 @@ const commands = [
 ];
 
 const rest = new REST({ version: "10" }).setToken(token);
+const appClientId = clientId;
+const appGuildId = guildId;
 
 async function deployCommands(): Promise<void> {
   await rest.put(
-    Routes.applicationGuildCommands(clientId, guildId),
+    Routes.applicationGuildCommands(appClientId, appGuildId),
     {
       body: commands.map((command) => command.toJSON()),
     }

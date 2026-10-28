@@ -1,44 +1,22 @@
 import "dotenv/config";
-import axios from "axios";
 import {
   Client,
   EmbedBuilder,
   Events,
   GatewayIntentBits,
 } from "discord.js";
+import {
+  DiscogsMarketplace,
+  type SearchResult,
+} from "discogs-marketplace-api-nodejs";
 
 const discordToken = process.env.DISCORD_BOT_TOKEN;
-const discogsToken = process.env.DISCOGS_TOKEN;
 
-if (!discordToken || !discogsToken) {
-  throw new Error(
-    "Missing DISCORD_BOT_TOKEN or DISCOGS_TOKEN in .env"
-  );
+if (!discordToken) {
+  throw new Error("Missing DISCORD_BOT_TOKEN in .env");
 }
 
-interface DiscogsListing {
-  id: number;
-  price?: {
-    value?: number;
-    currency?: string;
-  };
-  condition?: string;
-  sleeve_condition?: string;
-  ships_from?: string;
-  seller?: {
-    username?: string;
-  };
-  release?: {
-    title?: string;
-    artist?: string;
-    year?: number;
-    format?: string[];
-  };
-}
-
-interface DiscogsSearchResponse {
-  listings: DiscogsListing[];
-}
+type DiscogsListing = SearchResult["items"][number];
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds],
@@ -46,73 +24,105 @@ const client = new Client({
 
 async function searchMarketplace(
   artist: string
-): Promise<DiscogsListing[]> {
-  const response = await axios.get<DiscogsSearchResponse>(
-    "https://api.discogs.com/marketplace/search",
-    {
-      params: {
-        artist,
-        format: "Vinyl",
-        type: "release",
-        per_page: 10,
-        page: 1,
-      },
-      headers: {
-        Authorization: `Discogs token=${discogsToken}`,
-        "User-Agent": "DiscogNotify/1.0",
-      },
-      timeout: 15000,
-    }
-  );
+): Promise<SearchResult["items"]> {
+  const result = await DiscogsMarketplace.search({
+    query: artist,
+    sort: "listed,desc",
+    limit: 25,
+  });
 
-  return response.data.listings ?? [];
+  return result.items.filter(
+    (item) =>
+      item.isAvailable &&
+      item.formats.some((format) =>
+        format.toLowerCase().includes("vinyl")
+      )
+  );
 }
 
 function createListingEmbed(
   listing: DiscogsListing,
   artist: string
 ): EmbedBuilder {
-  const release = listing.release;
+  const artistNames = listing.artists
+    .map((artistInfo) => artistInfo.name)
+    .filter(Boolean)
+    .join(", ");
+
   const title = [
-    release?.artist ?? artist,
-    release?.title ?? "Vinyl release",
+    artistNames || artist,
+    listing.release.name || "Vinyl release",
   ].join(" — ");
 
-  const url = `https://www.discogs.com/sell/item/${listing.id}`;
-
-  const price = listing.price
-    ? `${listing.price.currency ?? ""} ${listing.price.value ?? "Unknown"}`
-    : "Not provided";
-
   const conditions = [
-    listing.condition
-      ? `Media: ${listing.condition}`
+    listing.condition.media.full
+      ? `Media: ${listing.condition.media.full}`
       : undefined,
-    listing.sleeve_condition
-      ? `Sleeve: ${listing.sleeve_condition}`
+    listing.condition.sleeve.full
+      ? `Sleeve: ${listing.condition.sleeve.full}`
       : undefined,
   ].filter((value): value is string => Boolean(value));
 
   const details = [
-    `**Price:** ${price}`,
+    `**Price:** ${listing.price.base}`,
     ...conditions,
-    listing.seller?.username
-      ? `**Seller:** ${listing.seller.username}`
-      : undefined,
-    listing.ships_from
-      ? `**Ships from:** ${listing.ships_from}`
-      : undefined,
-    release?.year
-      ? `**Year:** ${release.year}`
+    `**Seller:** ${listing.seller.name}`,
+    `**Ships from:** ${listing.country.name}`,
+    listing.release.year
+      ? `**Year:** ${listing.release.year}`
       : undefined,
   ].filter((value): value is string => Boolean(value));
 
   return new EmbedBuilder()
     .setTitle(title.slice(0, 256))
-    .setURL(url)
+    .setURL(listing.url)
     .setDescription(
       details.join("\n") || "Listing details are available on Discogs."
-    );
+    )
+    .setThumbnail(listing.imageUrl ?? null);
+}
+
+function isExpiredInteractionError(error: unknown): boolean {
+  return Boolean(
+    error &&
+      typeof error === "object" &&
+      "code" in error &&
+      error.code === 10062
+  );
+}
+
+async function safeReply(
+  interaction: {
+    reply: (...args: any[]) => Promise<unknown>;
+  },
+  payload: any
+): Promise<void> {
+  try {
+    await interaction.reply(payload);
+  } catch (error: unknown) {
+    if (isExpiredInteractionError(error)) {
+      console.warn("Ignoring expired interaction during reply.");
+      return;
+    }
+    throw error;
+  }
+}
+
+async function safeEditReply(
+  interaction: {
+    editReply: (...args: any[]) => Promise<unknown>;
+  },
+  payload: any
+): Promise<void> {
+  try {
+    await interaction.editReply(payload);
+  } catch (error: unknown) {
+    if (isExpiredInteractionError(error)) {
+      console.warn("Ignoring expired interaction during editReply.");
+      return;
+    }
+    throw error;
+  }
 }
 
 client.once(Events.ClientReady, (readyClient) => {
@@ -133,22 +143,33 @@ client.on(Events.InteractionCreate, async (interaction) => {
     .trim();
 
   if (!artist) {
-    await interaction.reply({
+    await safeReply(interaction, {
       content: "Please provide an artist name.",
       ephemeral: true,
     });
     return;
   }
 
-  await interaction.deferReply();
+  try {
+    await interaction.deferReply();
+  } catch (error: unknown) {
+    if (isExpiredInteractionError(error)) {
+      console.warn("Ignoring expired interaction before deferReply.");
+      return;
+    }
+    throw error;
+  }
 
   try {
     console.log(`Searching Discogs Marketplace for: ${artist}`);
 
     const listings = await searchMarketplace(artist);
 
+    console.dir(listings[0], { depth: null });
+
     if (listings.length === 0) {
-      await interaction.editReply(
+      await safeEditReply(
+        interaction,
         `No vinyl listings were found for **${artist}**. Try another artist name.`
       );
       return;
@@ -158,22 +179,20 @@ client.on(Events.InteractionCreate, async (interaction) => {
       createListingEmbed(listing, artist)
     );
 
-    await interaction.editReply({
+    await safeEditReply(interaction, {
       content: `Found ${listings.length} vinyl listing(s) matching **${artist}**:`,
       embeds,
     });
   } catch (error: unknown) {
-    if (axios.isAxiosError(error)) {
-      console.error(
-        "Discogs API request failed:",
-        error.response?.status,
-        error.response?.data ?? error.message
-      );
-    } else {
-      console.error("Vinyl search failed:", error);
+    console.error("Vinyl search failed:", error);
+
+    if (isExpiredInteractionError(error)) {
+      console.warn("Ignoring expired interaction after the search attempt.");
+      return;
     }
 
-    await interaction.editReply(
+    await safeEditReply(
+      interaction,
       "I couldn't complete the Discogs search. Please try again later."
     );
   }
